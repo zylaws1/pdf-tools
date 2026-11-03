@@ -113,12 +113,21 @@ interface GlyphArg {
 
 const OPS = pdfjs.OPS
 const SHOW_TEXT = new Set([OPS.showText, OPS.showSpacedText, OPS.nextLineShowText, OPS.nextLineSetSpacingShowText])
-const colorCache = new WeakMap<PdfjsDoc, Map<number, Promise<(string | null)[][]>>>()
+
+interface CharColor {
+  color: string
+  opacity: number
+}
+
+const colorCache = new WeakMap<PdfjsDoc, Map<number, Promise<(CharColor | null)[][]>>>()
+
+type GStatePair = [string, unknown]
 
 /**
- * The color each character of the page's text content is drawn in, read from the PDF's drawing operators
- * (pdf.js converts gray/CMYK/RGB fills to hex). null where unknown: invisible text (e.g. the OCR layer of a scan),
- * pattern fills, or characters that couldn't be matched up.
+ * The color and opacity each character of the page's text content is drawn with, read from the PDF's
+ * drawing operators (pdf.js converts gray/CMYK/RGB fills to hex; `ca`/`CA` in a `gs` graphics state give
+ * fill/stroke opacity). null where unknown: invisible text (e.g. the OCR layer of a scan), pattern fills,
+ * or characters that couldn't be matched up.
  */
 function pageCharColors(doc: PdfjsDoc, pageNumber: number) {
   let byPage = colorCache.get(doc)
@@ -128,9 +137,9 @@ function pageCharColors(doc: PdfjsDoc, pageNumber: number) {
     p = (async () => {
       const page = await doc.getPage(pageNumber)
       const [{ fnArray, argsArray }, content] = await Promise.all([page.getOperatorList(), page.getTextContent()])
-      // visible characters in drawing order, with the color they are painted in
-      const seq: { ch: string; color: string | null }[] = []
-      let state = { fill: '#000000' as string | null, stroke: '#000000' as string | null, mode: 0 }
+      // visible characters in drawing order, with the color and opacity they are painted with
+      const seq: { ch: string; color: string | null; opacity: number }[] = []
+      let state = { fill: '#000000' as string | null, stroke: '#000000' as string | null, fillAlpha: 1, strokeAlpha: 1, mode: 0 }
       const stack: (typeof state)[] = []
       fnArray.forEach((fn, i) => {
         const a = argsArray[i] as unknown[]
@@ -141,13 +150,19 @@ function pageCharColors(doc: PdfjsDoc, pageNumber: number) {
         else if (fn === OPS.setFillColorN || fn === OPS.setFillTransparent) state.fill = null
         else if (fn === OPS.setStrokeColorN || fn === OPS.setStrokeTransparent) state.stroke = null
         else if (fn === OPS.setTextRenderingMode) state.mode = a[0] as number
-        else if (SHOW_TEXT.has(fn)) {
+        else if (fn === OPS.setGState) {
+          for (const [key, value] of (a[0] as GStatePair[]) ?? []) {
+            if (key === 'ca' && typeof value === 'number') state.fillAlpha = value
+            else if (key === 'CA' && typeof value === 'number') state.strokeAlpha = value
+          }
+        } else if (SHOW_TEXT.has(fn)) {
           // render modes: 0/2/4/6 fill, 1/5 stroke only, 3/7 invisible
           const m = state.mode & 3
           const color = m === 3 ? null : m === 1 ? state.stroke : state.fill
+          const opacity = m === 1 ? state.strokeAlpha : state.fillAlpha
           for (const g of (a[0] as (GlyphArg | number)[]) ?? []) {
             if (typeof g !== 'object' || !g?.unicode) continue
-            for (const ch of g.unicode.normalize('NFKC')) if (ch.trim()) seq.push({ ch, color })
+            for (const ch of g.unicode.normalize('NFKC')) if (ch.trim()) seq.push({ ch, color, opacity })
           }
         }
       })
@@ -162,7 +177,7 @@ function pageCharColors(doc: PdfjsDoc, pageNumber: number) {
             const found = seq.slice(at, at + 64).findIndex(x => x.ch === c)
             if (found < 0) return null
             at += found + 1
-            return seq[at - 1].color
+            return seq[at - 1].color ? { color: seq[at - 1].color as string, opacity: seq[at - 1].opacity } : null
           }
           return null
         })
@@ -180,8 +195,9 @@ function pageCharColors(doc: PdfjsDoc, pageNumber: number) {
  */
 export async function colorGroups(doc: PdfjsDoc, pageNumber: number, run: TextRun, measure: (ch: string) => number) {
   const known = await pageCharColors(doc, pageNumber)
-  const groups: { str: string; x: number; w: number; color: string }[] = []
+  const groups: { str: string; x: number; w: number; color: string; opacity: number }[] = []
   let color: string | null = null
+  let opacity = 1
   for (const p of run.parts) {
     const chars = [...p.str]
     const widths = chars.map(c => Math.max(0.01, measure(c)))
@@ -190,22 +206,25 @@ export async function colorGroups(doc: PdfjsDoc, pageNumber: number, run: TextRu
     for (let i = 0; i < chars.length; i++) {
       const w = widths[i] * k
       const exact = known[p.item]?.[i]
-      if (exact) color = exact
+      if (exact) ({ color, opacity } = exact)
       else if (chars[i].trim()) {
         const s = await sampleColors(doc, pageNumber, { ...run, x, w })
         // too little ink to tell (dots, thin punctuation): keep the color around it
-        if (s.ink >= 6) color = s.text
+        if (s.ink >= 6) {
+          color = s.text
+          opacity = 1
+        }
       }
       const last = groups[groups.length - 1]
       const space = i === 0 && p.space ? ' ' : ''
-      if (last && (last.color === color || !color)) {
+      if (last && ((last.color === color && last.opacity === opacity) || !color)) {
         last.str += space + chars[i]
         last.w = x + w - last.x
       } else if (last && !last.color) {
         // the line started with characters of unknown color
-        Object.assign(last, { str: last.str + space + chars[i], w: x + w - last.x, color })
+        Object.assign(last, { str: last.str + space + chars[i], w: x + w - last.x, color, opacity })
       } else {
-        groups.push({ str: chars[i], x, w, color: color ?? '' })
+        groups.push({ str: chars[i], x, w, color: color ?? '', opacity })
       }
       x += w
     }

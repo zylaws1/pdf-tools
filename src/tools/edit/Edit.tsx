@@ -257,7 +257,8 @@ export default function Edit() {
     const fontKey = own ?? fallback
     const variant = variantOf(run.bold, run.italic)
     await fonts.load(fontKey, variant)
-    if (own) void fonts.load(fallback, variant)
+    // best-effort warm-up for the fallback font; a failure here must not become an unhandled rejection
+    if (own) void fonts.load(fallback, variant).catch(() => {})
     const fam = fonts.get(fontKey)
     const size = Math.round(run.size * 10) / 10
     const { bg } = await sampleColors(file.doc, page + 1, run)
@@ -280,7 +281,7 @@ export default function Edit() {
         align: 'left',
         lineHeight: 1.2,
         color: g.color,
-        opacity: 1,
+        opacity: g.opacity,
         srcRun: run.id,
       }),
     )
@@ -364,7 +365,13 @@ export default function Edit() {
   }
 
   const onElDown = (e: RPointerEvent, el: El, scale: number) => {
-    if (e.button !== 0 || editingId === el.id) return
+    if (e.button !== 0) return
+    // a stray click on the box being edited (not its textarea, which stops propagation itself) must not
+    // bubble up to the page and end the edit — clicking to place the cursor shouldn't deselect
+    if (editingId === el.id) {
+      e.stopPropagation()
+      return
+    }
     blurActive()
     const wasSelected = el.id === selectedId
     setSelectedId(el.id)

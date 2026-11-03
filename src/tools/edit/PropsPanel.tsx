@@ -1,7 +1,93 @@
+import { useState } from 'react'
 import { Icon } from '../../components/Icon'
 import { KIND_LABEL, isLinear, type El, type LayerOp } from './model'
 import { useFontRegistry } from './fonts'
 import { FontPicker } from './FontPicker'
+import { guessLanguage, translateText, LANGS } from '../../lib/translate'
+import { fixGrammar } from '../../lib/grammar'
+
+const LAST_TO_KEY = 'pdf-tools:translate-to'
+
+function FixGrammar({ text, onChange }: { text: string; onChange: (patch: Partial<El>) => void }) {
+  const [state, setState] = useState<{ busy: boolean; via?: 'on-device' | 'online'; fixes?: number; error?: string }>({ busy: false })
+
+  const run = async () => {
+    setState({ busy: true })
+    try {
+      const result = await fixGrammar(text)
+      onChange({ text: result.text })
+      setState({ busy: false, via: result.via, fixes: result.fixes })
+    } catch (e) {
+      setState({ busy: false, error: e instanceof Error ? e.message : String(e) })
+    }
+  }
+
+  return (
+    <div className="field">
+      <button className="btn-secondary" disabled={state.busy || !text.trim()} onClick={run}>
+        <Icon name="check" size={14} /> {state.busy ? 'Checking…' : 'Fix grammar'}
+      </button>
+      {state.via && state.fixes === 0 && <p className="hint">No issues found.</p>}
+      {state.via === 'online' && !!state.fixes && <p className="hint">Fixed {state.fixes} issue{state.fixes === 1 ? '' : 's'} via a free grammar API — this text left your device.</p>}
+      {state.via === 'on-device' && !!state.fixes && <p className="hint">Fixed {state.fixes} issue{state.fixes === 1 ? '' : 's'} on-device; nothing was sent anywhere.</p>}
+      {state.error && <p className="warn">Grammar check failed: {state.error}</p>}
+    </div>
+  )
+}
+
+// Keyed by el.id from the caller, so picking a different element re-guesses "from" fresh
+// (a new useState initializer) without fighting the user's own choice while they keep typing.
+function Translate({ text, onChange }: { text: string; onChange: (patch: Partial<El>) => void }) {
+  const [from, setFrom] = useState(() => guessLanguage(text) ?? 'en')
+  const [to, setTo] = useState(() => localStorage.getItem(LAST_TO_KEY) ?? 'zh')
+  const [state, setState] = useState<{ busy: boolean; via?: 'on-device' | 'online'; error?: string }>({ busy: false })
+
+  const run = async () => {
+    setState({ busy: true })
+    try {
+      const result = await translateText(text, from, to)
+      onChange({ text: result.text })
+      setState({ busy: false, via: result.via })
+    } catch (e) {
+      setState({ busy: false, error: e instanceof Error ? e.message : String(e) })
+    }
+  }
+
+  return (
+    <div className="field">
+      Translate
+      <div className="field-row">
+        <select value={from} onChange={e => setFrom(e.target.value)}>
+          {LANGS.map(l => (
+            <option key={l.code} value={l.code}>
+              {l.label}
+            </option>
+          ))}
+        </select>
+        <span className="muted">→</span>
+        <select
+          value={to}
+          onChange={e => {
+            setTo(e.target.value)
+            localStorage.setItem(LAST_TO_KEY, e.target.value)
+          }}
+        >
+          {LANGS.map(l => (
+            <option key={l.code} value={l.code}>
+              {l.label}
+            </option>
+          ))}
+        </select>
+      </div>
+      <button className="btn-secondary" disabled={state.busy || !text.trim()} onClick={run}>
+        <Icon name="translate" size={14} /> {state.busy ? 'Translating…' : 'Translate'}
+      </button>
+      {state.via === 'online' && <p className="hint">Sent to a free translation API (MyMemory) — this text left your device.</p>}
+      {state.via === 'on-device' && <p className="hint">Translated on-device; nothing was sent anywhere.</p>}
+      {state.error && <p className="warn">Translation failed: {state.error}</p>}
+    </div>
+  )
+}
 
 interface Props {
   el: El
@@ -69,6 +155,8 @@ export function PropsPanel({ el, onChange, onPickFont, onUploadFont, onDuplicate
             Text <span className="muted">(or double-click it on the page)</span>
             <textarea rows={3} value={el.text} onChange={e => onChange({ text: e.target.value })} />
           </label>
+          <Translate key={el.id} text={text} onChange={onChange} />
+          <FixGrammar key={el.id} text={text} onChange={onChange} />
           <div className="field">
             Font
             <FontPicker value={el.font ?? 'helvetica'} onPick={onPickFont} onUpload={onUploadFont} />

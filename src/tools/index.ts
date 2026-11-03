@@ -5,8 +5,10 @@ import Organize from './Organize'
 import ImagesToPdf from './ImagesToPdf'
 import PdfToImages from './PdfToImages'
 
-// the editor pulls in font tooling, so it's loaded only when opened
+// all three pull in the editor's font/text-extraction tooling, so they're loaded only when opened
 const Edit = lazy(() => import('./edit/Edit'))
+const Translate = lazy(() => import('./Translate'))
+const GrammarFix = lazy(() => import('./GrammarFix'))
 
 export interface ToolDef {
   id: string
@@ -26,4 +28,6 @@ export const TOOLS: ToolDef[] = [
   { id: 'organize', title: 'Organize PDF', short: 'Organize', desc: 'Reorder, rotate and delete pages, or mix pages from several files.', colors: ['#fbbf24', '#fb7185'], icon: 'organize', Component: Organize },
   { id: 'image-to-pdf', title: 'Image to PDF', short: 'Image → PDF', desc: 'Turn JPG, PNG and WebP images into a clean PDF with your page size and margins.', colors: ['#34d399', '#5eead4'], icon: 'img2pdf', Component: ImagesToPdf },
   { id: 'pdf-to-image', title: 'PDF to Image', short: 'PDF → Image', desc: 'Export every page as a sharp JPG or PNG, up to 300 dpi.', colors: ['#f472b6', '#a78bfa'], icon: 'pdf2img', Component: PdfToImages },
+  { id: 'translate', title: 'Translate PDF', short: 'Translate', desc: 'Translate every line of text in place, keeping the original layout, fonts and positions.', colors: ['#a78bfa', '#5eead4'], icon: 'translate', Component: Translate },
+  { id: 'grammar', title: 'Fix grammar in PDF', short: 'Fix grammar', desc: 'Correct spelling and grammar issues in place, without disturbing the layout.', colors: ['#fb7185', '#fbbf24'], icon: 'check', Component: GrammarFix },
 ]

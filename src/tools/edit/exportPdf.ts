@@ -6,29 +6,41 @@ import { applyForm, type FormState } from './form'
 
 const color = (hex: string) => rgb(...hexToRgb01(hex))
 
+/** The one font-related failure users can actually act on (pick a different font) — everything else below is swallowed per element. */
+class FontCoverageError extends Error {}
+
 export async function exportPdf(bytes: Uint8Array, els: El[], viewports: PageViewport[], form: FormState | null) {
   // decide each text element's fonts once, so subsetting and drawing always agree
   const fontOf = new Map<El, { fam: FontFamily; fallback: FontFamily | null }>()
   for (const el of els) {
     if (el.kind !== 'text' || el.hidden) continue
-    const fam = fontRegistry.get(el.font)
-    const load = (f: FontFamily) => fontRegistry.load(f.key, fontRegistry.pick(f, el.bold, el.italic).variant)
-    await load(fam)
-    // loading a fallback can reveal it lacks glyphs too and switch to the next one, which then needs loading
-    let fallback = fontRegistry.fallbackOf(el.font, el.text ?? '', el.fallbackFont)
-    for (let i = 0; fallback && i < 3; i++) {
-      await load(fallback)
-      const next = fontRegistry.fallbackOf(el.font, el.text ?? '', el.fallbackFont)
-      if (next === fallback) break
-      fallback = next
+    try {
+      const fam = fontRegistry.get(el.font)
+      const load = async (f: FontFamily) => {
+        try {
+          await fontRegistry.load(f.key, fontRegistry.pick(f, el.bold, el.italic).variant)
+        } catch (e) {
+          throw new Error(`Font "${f.key}" failed to load: ${e instanceof Error ? e.message : String(e)}`)
+        }
+      }
+      await load(fam)
+      // loading a fallback can reveal it lacks glyphs too and switch to the next one, which then needs loading
+      let fallback = fontRegistry.fallbackOf(el.font, el.text ?? '', el.fallbackFont)
+      for (let i = 0; fallback && i < 3; i++) {
+        await load(fallback)
+        const next = fontRegistry.fallbackOf(el.font, el.text ?? '', el.fallbackFont)
+        if (next === fallback) break
+        fallback = next
+      }
+      fontOf.set(el, { fam, fallback })
+    } catch (e) {
+      // same font-loading step the drawing loop below also does; an element missing from fontOf
+      // here is skipped there too, with the same warning, instead of crashing the whole export
+      console.warn(`Skipping an element on page ${el.page + 1} whose font failed to load:`, e)
     }
-    fontOf.set(el, { fam, fallback })
   }
   const pdf = await openForWriting(bytes)
   const embedder = new FontEmbedder(pdf)
-  for (const [el, { fam, fallback }] of fontOf) {
-    for (const seg of fontRegistry.segments(fam, fallback, (el.text ?? '').replace(/\n/g, ''))) embedder.use(seg.fam, el.bold, el.italic, seg.text)
-  }
   // the same signature placed on many pages is embedded once
   const images = new Map<ImgData, PDFImage>()
   if (form) applyForm(pdf.getForm(), form)
@@ -63,6 +75,10 @@ export async function exportPdf(bytes: Uint8Array, els: El[], viewports: PageVie
       }
     }
 
+    // an element whose font/glyph data trips an internal parser bug (seen with some system fonts) shouldn't
+    // sink the whole document; it's dropped with a warning instead. A font that's simply missing glyphs is
+    // different — FontCoverageError is deliberate and actionable, so it still fails the whole export.
+    try {
     switch (el.kind) {
       case 'whiteout':
       case 'highlight':
@@ -145,7 +161,7 @@ export async function exportPdf(bytes: Uint8Array, els: El[], viewports: PageVie
               try {
                 font.encodeText(seg.text)
               } catch {
-                throw new Error(`"${line}" uses characters that ${seg.fam.label} can't display. Pick another font for this text.`)
+                throw new FontCoverageError(`"${line}" uses characters that ${seg.fam.label} can't display. Pick another font for this text.`)
               }
             }
             // the skew is applied in unrotated text space, so simulated italic is only drawn on upright pages
@@ -175,6 +191,10 @@ export async function exportPdf(bytes: Uint8Array, els: El[], viewports: PageVie
         })
         break
       }
+    }
+    } catch (e) {
+      if (e instanceof FontCoverageError) throw e
+      console.warn(`Skipping an element on page ${el.page + 1} that failed to export:`, e)
     }
   }
   return pdf.save()

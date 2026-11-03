@@ -15,7 +15,6 @@ import {
   type PDFPage,
 } from 'pdf-lib'
 import { uid } from '../../lib/pdf'
-import { subsetFont } from './subset'
 
 // The package's runtime export is a default export, but its typings only declare named ones
 export const fontkit = (fontkitModule as unknown as { default?: typeof fontkitModule }).default ?? fontkitModule
@@ -188,7 +187,22 @@ function parse(bytes: Uint8Array, postscriptName?: string): FkFont {
 }
 
 /** No CJK fonts are bundled; such text needs a font from the PDF itself, this computer or an upload. */
-const needsCjk = (text: string) => /[\u3040-\u30ff\uac00-\ud7af\u1100-\u11ff\u3400-\u9fff\uf900-\ufaff\u3000-\u303f\uff00-\uffef]/.test(text)
+export const needsCjk = (text: string) => /[\u3040-\u30ff\uac00-\ud7af\u1100-\u11ff\u3400-\u9fff\uf900-\ufaff\u3000-\u303f\uff00-\uffef]/.test(text)
+// Broad hint for picking a CJK-capable system font by name \u2014 a PDF/translation's own font name
+// (e.g. "Arial") never hints at CJK coverage the way it does for ordinary text, so this can't go
+// through the usual name-matching path at all.
+// Script-specific name hints for picking a *candidate list* of system fonts for CJK text — ordered
+// roughly by how broad/standard each is, since a name match alone doesn't mean a font actually has
+// the glyphs (e.g. "AppleGothic" name-matches generically but is Korean-only); callers must still
+// verify with supports() before committing to one. Separate scripts matter: a Korean-leaning name
+// like "AppleGothic" would otherwise win a Chinese search just by sorting first.
+const HANGUL = /[가-힣]/
+const KANA = /[぀-ヿ]/
+const CJK_FONT_NAME_BY_SCRIPT = {
+  ko: [/^apple sd gothic neo$/i, /malgun/i, /batang|dotum|gulim/i, /nanum/i, /gothic/i],
+  ja: [/^hiragino sans$/i, /^hiragino.*gothic/i, /yu\s?gothic/i, /meiryo/i, /hiragino/i, /toppan|tsukushi/i],
+  zh: [/^pingfang sc$/i, /^pingfang/i, /heiti sc|songti sc/i, /^hei$|^kai$/i, /heiti|songti|kaiti|yuanti|xingkai|fangsong|lantinghei|simsong|biaukai/i],
+} as const
 
 class FontRegistry {
   private fams = new Map<string, FontFamily>()
@@ -224,6 +238,28 @@ class FontRegistry {
     return [...this.fams.values()]
   }
 
+  /**
+   * System fonts worth trying for CJK text, in priority order — a name match alone doesn't guarantee
+   * the glyphs are actually there, so this is a *candidate list* for a caller to verify with
+   * supports() (after loading each), not a single final answer. Script-aware: a Korean-leaning name
+   * would otherwise win a Chinese search just by sorting first in the installed-fonts list.
+   */
+  cjkSystemCandidates(text: string): FontFamily[] {
+    const patterns = CJK_FONT_NAME_BY_SCRIPT[HANGUL.test(text) ? 'ko' : KANA.test(text) ? 'ja' : 'zh']
+    const system = this.list().filter(f => f.group === 'system')
+    const seen = new Set<string>()
+    const out: FontFamily[] = []
+    for (const pattern of patterns) {
+      for (const f of system) {
+        if (pattern.test(f.label) && !seen.has(f.key)) {
+          seen.add(f.key)
+          out.push(f)
+        }
+      }
+    }
+    return out
+  }
+
   get(key?: string) {
     return (key && this.fams.get(key)) || this.fams.get('helvetica')!
   }
@@ -247,12 +283,21 @@ class FontRegistry {
     return { ...style, fontSynthesis: [p.fakeBold && 'weight', p.fakeItalic && 'style'].filter(Boolean).join(' ') || 'none' }
   }
 
-  /** true/false if known; undefined if the font hasn't been parsed yet. */
+  /**
+   * true/false if known; undefined if the font hasn't been parsed yet. A font whose tables are
+   * inconsistent (seen with some PDF-embedded subset fonts: a cmap entry pointing at a glyph the
+   * subsetted glyf/loca tables no longer have) can throw from fontkit while just being asked this —
+   * that's not a real answer either way, so it's treated as "doesn't support" rather than propagated.
+   */
   supports(f: FontFamily, text: string): boolean | undefined {
     const chars = [...text].filter(c => c !== '\n' && c !== '\r')
     if (f.standard) return chars.every(winAnsiOk)
     if (!f.glyphs) return undefined
-    return chars.every(c => c === ' ' || f.glyphs!.hasGlyphForCodePoint(c.codePointAt(0)!))
+    try {
+      return chars.every(c => c === ' ' || f.glyphs!.hasGlyphForCodePoint(c.codePointAt(0)!))
+    } catch {
+      return false
+    }
   }
 
   /**
@@ -260,7 +305,13 @@ class FontRegistry {
    * and the browser then draws them with the next font in the list, so saving must do the same.
    */
   private hasChar(f: FontFamily, ch: string) {
-    if (ch === ' ' && f.glyphs && !f.standard) return f.glyphs.hasGlyphForCodePoint(0x20)
+    if (ch === ' ' && f.glyphs && !f.standard) {
+      try {
+        return f.glyphs.hasGlyphForCodePoint(0x20)
+      } catch {
+        return false
+      }
+    }
     return this.supports(f, ch)
   }
 
@@ -280,7 +331,9 @@ class FontRegistry {
     for (const k of [fallbackKey, 'lib:arimo']) {
       if (!k || k === f.key || !this.fams.has(k)) continue
       const c = this.fams.get(k)!
-      if (this.supports(c, missing) === undefined) void this.load(k)
+      // best-effort: this result is re-checked (and, for exportPdf/autoReplace, awaited) once it
+      // loads; a failure here (e.g. a malformed system font) must not become an unhandled rejection
+      if (this.supports(c, missing) === undefined) void this.load(k).catch(() => {})
       if (this.supports(c, missing) !== false) return c
     }
     return null
@@ -346,14 +399,28 @@ class FontRegistry {
   }
 
   /** Finds the closest available family for a font name used in a PDF. */
-  match(pdfFontName: string, text = '', hint: FontCategory = 'sans') {
+  /**
+   * `allowSystem` lets a caller that doesn't want *any* dependence on the Local Font Access API
+   * (the batch Translate/Fix-grammar tools, via autoReplace.ts) opt out of it entirely: without it,
+   * a document whose own font happens to share a name with one of the user's installed system fonts
+   * (this is common — "Arial", "ArialNarrow", etc.) would silently pick that system font for ordinary
+   * Latin text too, not just CJK. System fonts are real files of unpredictable internal structure,
+   * and subsetting/embedding one has — independent of script — triggered an internal fontkit "buffer
+   * length" crash during the final whole-document PDF save, a point no per-element error handling can
+   * isolate. The interactive editor still allows it (default): there, it's only ever reached by the
+   * user's own explicit choice in the font picker, where a bad result is visible and fixable.
+   */
+  match(pdfFontName: string, text = '', hint: FontCategory = 'sans', allowSystem = true) {
     const clean = pdfFontName.replace(/^[A-Z]{6}\+/, '')
     const full = norm(clean.split(/[-,]/)[0])
     // try "SourceSansPro" as-is before stripping suffixes like PSMT/Pro/Std
     const names = [...new Set([full, full.replace(/(psmt|mt|ps|std|pro|lt|regular)$/, '')])]
-    // CJK text can only be matched to an installed font (none are bundled)
     const cjk = needsCjk(text)
-    const candidates = this.list().filter(f => f.group !== 'document' && (!cjk || f.group === 'system'))
+    // CJK has no bundled fallback at all. cjkSystemCandidates() (tried by the caller, autoReplace.ts,
+    // before falling back to this) is the real way one gets picked; nothing here can verify a system
+    // font actually has the right glyphs by name alone, so this just keeps CJK out of the ordinary
+    // name-matching below (a PDF's own font name never hints at CJK coverage anyway).
+    const candidates = this.list().filter(f => f.group !== 'document' && (allowSystem || f.group !== 'system') && !(cjk && f.group === 'system'))
     const byName =
       candidates.find(f => f.group === 'system' && Object.values(f.sources).some(s => s?.postscriptName === clean)) ??
       candidates.find(f => f.group === 'system' && names.includes(norm(f.label))) ??
@@ -482,19 +549,9 @@ export class FontEmbedder {
   private cache = new Map<string, PDFFont>()
   private pdf: PDFDocument
 
-  private usage = new Map<string, Set<number>>()
-
   constructor(pdf: PDFDocument) {
     this.pdf = pdf
     pdf.registerFontkit(fontkit)
-  }
-
-  /** Records text that will be drawn, so each font is subset once with every character it needs. */
-  use(f: FontFamily, bold: boolean | undefined, italic: boolean | undefined, text: string) {
-    const key = `${f.key}:${fontRegistry.pick(f, bold, italic).variant}`
-    const set = this.usage.get(key) ?? new Set([0x20])
-    for (const ch of text) set.add(ch.codePointAt(0)!)
-    this.usage.set(key, set)
   }
 
   async get(f: FontFamily, bold = false, italic = false) {
@@ -502,16 +559,20 @@ export class FontEmbedder {
     const key = `${f.key}:${variant}`
     let font = this.cache.get(key)
     if (!font) {
-      if (f.standard) font = await this.pdf.embedFont(f.standard[variant])
-      else {
-        const { bytes, postscriptName } = await fontRegistry.faceBytes(f, variant)
-        let index = 0
-        if (postscriptName) {
-          const parsed = fontkit.create(bytes) as unknown as { fonts?: { postscriptName: string }[] }
-          index = Math.max(0, parsed.fonts?.findIndex(x => x.postscriptName === postscriptName) ?? 0)
+      try {
+        if (f.standard) font = await this.pdf.embedFont(f.standard[variant])
+        else {
+          // No subsetting, ever: confirmed in isolation (plain Node, no browser, no PDF) that
+          // HarfBuzz's subsetter can reliably corrupt its own output (a malformed last glyph) for an
+          // entirely ordinary range of characters, surfacing later as fontkit's "buffer length" crash
+          // during the one whole-document save step no per-element try/catch can isolate. The full,
+          // un-subset file has always swept glyph-by-glyph clean in every font tested. The cost is a
+          // bigger embedded font than a reduced glyph set would need — worth it for never corrupting.
+          const { bytes } = await fontRegistry.faceBytes(f, variant)
+          font = await this.pdf.embedFont(bytes, { subset: false })
         }
-        const sub = await subsetFont(bytes, this.usage.get(key) ?? [0x20], index)
-        font = await this.pdf.embedFont(sub, { subset: false })
+      } catch (e) {
+        throw new Error(`Font "${key}" failed to embed: ${e instanceof Error ? e.message : String(e)}`)
       }
       this.cache.set(key, font)
     }

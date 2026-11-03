@@ -32,6 +32,8 @@ const PATHS = {
   signature: 'M3 16c1.5-2.5 3-8 5-8s0 7 2 7 2.5-5 4.5-5-.5 4 1.5 4c1.2 0 2-1 3-1.5M3 20h18',
   pages: 'M8 3h10v14H8zM5 7v14h10',
   shield:'M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z',
+  translate: 'M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18zM3 12h18M12 3c2.5 2.3 4 5.6 4 9s-1.5 6.7-4 9c-2.5-2.3-4-5.6-4-9s1.5-6.7 4-9z',
+  check: 'M5 13l4.5 4.5L19 8',
 }
 
 export type IconName = keyof typeof PATHS
